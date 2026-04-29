@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Large data and checkpoints
+Wan2.1-*/
+latents/
+latents_*/
+*.pt
+*.mp4
+*.png
+*.jpg
+*.jpeg
+!assets/*.png
+!assets/*.jpg
+
+# User excluded
+chordedit/
+ChordEdit/
+
+# IDE
+.vscode/
+.idea/
