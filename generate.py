@@ -266,8 +266,8 @@ def _parse_args():
         "--inversion_free_t_start",
         type=float,
         default=1.0,
-        help="The starting time for inversion-free mode (0.0 to 1.0). 1.0 means full noise."
-    )
+        help="The starting time for inversion-free mode (0.0 to 1.0, where 1.0 is full noise)."
+        )
     
     # <<< MODIFICATION END >>>
 
@@ -355,10 +355,13 @@ def read_video_to_tensor(video_path, device=None):
     if frames_list:
         # Stack the frames into a single numpy array (T, H, W, C)
         video_array = np.array(frames_list)
+        
+        # Ensure it's a standard numpy array (fix for type mismatch)
+        video_array = np.ascontiguousarray(video_array, dtype=np.uint8)
 
         # --- Conversion to Tensor ---
         # 1. Convert numpy array to torch tensor (inherits shape: T, H, W, C)
-        video_tensor = torch.from_numpy(video_array) # shape (T, H, W, C), dtype uint8
+        video_tensor = torch.tensor(video_array) # shape (T, H, W, C), dtype uint8
 
         # 2. Permute dimensions to (C, T, H, W)
         video_tensor = video_tensor.permute(3, 0, 1, 2) # shape (C, T, H, W)
