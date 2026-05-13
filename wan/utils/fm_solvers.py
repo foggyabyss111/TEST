@@ -19,8 +19,37 @@ if is_scipy_available():
     pass
 
 
+def _safe_np_to_tensor(arr, dtype=None):
+    # 将 numpy / tensor 输入统一转换为 torch.Tensor。
+    # 物理含义：这里的 arr 往往是噪声强度 sigma 或时间步等离散采样表，
+    # 这些量在扩散/流匹配采样中决定每一步去噪幅度与状态更新尺度。
+    # dtype: 目标数据类型；若不传则默认转为 float32（推理中常用精度）。
+    if isinstance(arr, torch.Tensor):
+        return arr if dtype is None else arr.to(dtype)
+    # 保证内存连续，避免 frombuffer/view 类操作出现跨步读取问题。
+    arr = np.ascontiguousarray(arr)
+    if arr.dtype == np.float32:
+        # 直接按底层字节构造，减少额外拷贝。
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.float32)
+    elif arr.dtype == np.float64:
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.float64)
+    elif arr.dtype in (np.int32, np.uint32):
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.int32 if arr.dtype == np.int32 else torch.uint32)
+    elif arr.dtype in (np.int64, np.uint64):
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.int64 if arr.dtype == np.int64 else torch.uint64)
+    else:
+        t = torch.tensor(arr)
+    # reshape 回原始形状，并统一 dtype。
+    t = t.reshape(arr.shape).to(torch.float32 if dtype is None else dtype)
+    return t
+
+
 def get_sampling_sigmas(sampling_steps, shift):
+    # 线性生成 [1, 0) 的 sigma 序列（长度=采样步数）。
+    # sigma 可理解为“噪声占比”，sigma 越大表示样本越噪，越小表示越接近数据流形。
     sigma = np.linspace(1, 0, sampling_steps + 1)[:sampling_steps]
+    # shift 重参数化：非线性拉伸 sigma 曲线，改变“前期/后期”去噪步长分配。
+    # shift>1 通常会让前段保留更多噪声、后段更细化。
     sigma = (shift * sigma / (1 + (shift - 1) * sigma))
 
     return sigma
@@ -34,6 +63,10 @@ def retrieve_timesteps(
     sigmas=None,
     **kwargs,
 ):
+    # 统一调度器时间步入口：
+    # - timesteps: 直接给离散时间索引；
+    # - sigmas: 直接给噪声日程；
+    # - num_inference_steps: 仅给步数，由调度器自己生成时间表。
     if timesteps is not None and sigmas is not None:
         raise ValueError(
             "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
@@ -145,6 +178,15 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         variance_type: Optional[str] = None,
         invert_sigmas: bool = False,
     ):
+        # num_train_timesteps: 训练时离散时间长度 T。
+        # solver_order: 多步求解阶数（1/2/3 阶），高阶通常更少步数下更准。
+        # prediction_type: Flow Matching 下应为 flow_prediction（预测“流/速度”）。
+        # shift/use_dynamic_shifting: 控制 sigma 时间表形状（固定或动态）。
+        # algorithm_type: 选择 ODE/SDE 变体求解公式。
+        # solver_type: 二阶时 midpoint 或 heun，不同数值稳定性/误差常数。
+        # lower_order_final/euler_at_final: 小步数时末段稳定性技巧。
+        # final_sigmas_type: 最后一个 sigma 是 0（理想去噪终点）还是 sigma_min。
+        # variance_type: 某些模型会同时预测方差。
         if algorithm_type in ["dpmsolver", "sde-dpmsolver"]:
             deprecation_message = f"algorithm_type {algorithm_type} is deprecated and will be removed in a future version. Choose from `dpmsolver++` or `sde-dpmsolver++` instead"
             deprecate("algorithm_types dpmsolver and sde-dpmsolver", "1.0.0",
@@ -175,10 +217,13 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         # setable values
         self.num_inference_steps = None
+        # alpha 在本实现中从 1 递减到 1/T，再反转后得到从小到大的“训练离散刻度”。
+        # 这里并非 DDPM 的 alpha_cumprod，而是 flow-matching 版本中简化映射变量。
         alphas = np.linspace(1, 1 / num_train_timesteps,
                              num_train_timesteps)[::-1].copy()
+        # sigma = 1 - alpha，可理解为噪声分量权重。
         sigmas = 1.0 - alphas
-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
+        sigmas = _safe_np_to_tensor(sigmas, dtype=torch.float32)
 
         if not use_dynamic_shifting:
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
@@ -186,9 +231,12 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                                        (shift - 1) * sigmas)  # pyright: ignore
 
         self.sigmas = sigmas
+        # timesteps 与 sigma 线性映射到 [0, T]。
         self.timesteps = sigmas * num_train_timesteps
 
+        # model_outputs: 多步法历史缓存，保存最近 k 次网络输出用于高阶差分。
         self.model_outputs = [None] * solver_order
+        # lower_order_nums: 前几步历史不足时，自动退化为低阶更新计数器。
         self.lower_order_nums = 0
         self._step_index = None
         self._begin_index = None
@@ -240,21 +288,26 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
         """
 
+        # use_dynamic_shifting=True 时，mu 控制分辨率相关的时间重标定强度。
+        # 可理解为根据图像/视频尺度调整“时间流速”。
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError(
                 " you have to pass a value for `mu` when `use_dynamic_shifting` is set to be `True`"
             )
 
         if sigmas is None:
+            # 默认从 sigma_max -> sigma_min 做均匀离散（去噪主路径）。
             sigmas = np.linspace(self.sigma_max, self.sigma_min,
                                  num_inference_steps +
                                  1).copy()[:-1]  # pyright: ignore
 
         if self.config.use_dynamic_shifting:
+            # 动态位移：根据 mu 进行非线性时间变换。
             sigmas = self.time_shift(mu, 1.0, sigmas)  # pyright: ignore
         else:
             if shift is None:
                 shift = self.config.shift
+            # 固定位移：通过有理函数重映射 sigma 日程。
             sigmas = shift * sigmas / (1 +
                                        (shift - 1) * sigmas)  # pyright: ignore
 
@@ -269,11 +322,12 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             )
 
         timesteps = sigmas * self.config.num_train_timesteps
+        # 末尾拼接 sigma_last，便于 step() 中访问 step_index+1。
         sigmas = np.concatenate([sigmas, [sigma_last]
                                 ]).astype(np.float32)  # pyright: ignore
 
-        self.sigmas = torch.from_numpy(sigmas)
-        self.timesteps = torch.from_numpy(timesteps).to(
+        self.sigmas = _safe_np_to_tensor(sigmas)
+        self.timesteps = _safe_np_to_tensor(timesteps).to(
             device=device, dtype=torch.int64)
 
         self.num_inference_steps = len(timesteps)
@@ -299,6 +353,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         https://arxiv.org/abs/2205.11487
         """
         dtype = sample.dtype
+        # batch_size: 批大小；channels: 通道数；remaining_dims: 空间或时空维度(H,W[,T])。
         batch_size, channels, *remaining_dims = sample.shape
 
         if dtype not in (torch.float32, torch.float64):
@@ -310,6 +365,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
 
+        # s: 每个样本的分位阈值，抑制极端像素/潜变量值，防止饱和。
         s = torch.quantile(
             abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
         s = torch.clamp(
@@ -328,13 +384,18 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     # Copied from diffusers.schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteScheduler._sigma_to_t
     def _sigma_to_t(self, sigma):
+        # sigma -> 离散时间索引 t（线性映射）。
         return sigma * self.config.num_train_timesteps
 
     def _sigma_to_alpha_sigma_t(self, sigma):
+        # 在 flow 形式下可写为 x = alpha * x0 + sigma * noise，这里 alpha=1-sigma。
         return 1 - sigma, sigma
 
     # Copied from diffusers.schedulers.scheduling_flow_match_euler_discrete.set_timesteps
     def time_shift(self, mu: float, sigma: float, t: torch.Tensor):
+        # 时间重参数化函数：
+        # mu 控制整体平移；sigma(此处形参)控制曲线形状；
+        # t 为原始时间/噪声刻度，输出为变换后刻度。
         return math.exp(mu) / (math.exp(mu) + (1 / t - 1)**sigma)
 
     # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.convert_model_output
@@ -376,9 +437,11 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Passing `timesteps` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
             )
 
-        # DPM-Solver++ needs to solve an integral of the data prediction model.
+        # DPM-Solver++ 以“数据预测积分形式”更新状态。
+        # 对 flow_prediction：网络输出可视为速度场 v_theta(x_t, t)。
         if self.config.algorithm_type in ["dpmsolver++", "sde-dpmsolver++"]:
             if self.config.prediction_type == "flow_prediction":
+                # sigma_t: 当前时刻噪声权重；x0_pred: 反推出的“无噪样本”估计。
                 sigma_t = self.sigmas[self.step_index]
                 x0_pred = sample - sigma_t * model_output
             else:
@@ -392,9 +455,10 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
             return x0_pred
 
-        # DPM-Solver needs to solve an integral of the noise prediction model.
+        # DPM-Solver 以“噪声预测积分形式”更新状态。
         elif self.config.algorithm_type in ["dpmsolver", "sde-dpmsolver"]:
             if self.config.prediction_type == "flow_prediction":
+                # epsilon: 对应噪声项估计（在当前参数化下由 sample 与 flow 输出组合得到）。
                 sigma_t = self.sigmas[self.step_index]
                 epsilon = sample - (1 - sigma_t) * model_output
             else:
@@ -454,15 +518,19 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Passing `prev_timestep` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
             )
 
+        # s 表示当前步，t 表示下一步（更干净方向）；sigma_s -> sigma_t。
         sigma_t, sigma_s = self.sigmas[self.step_index + 1], self.sigmas[
             self.step_index]  # pyright: ignore
+        # alpha/sigma 是状态分解系数；lambda=log(alpha)-log(sigma) 为对数信噪比型变量。
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s, sigma_s = self._sigma_to_alpha_sigma_t(sigma_s)
         lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
         lambda_s = torch.log(alpha_s) - torch.log(sigma_s)
 
+        # h: 对数域步长，决定本次数值积分步幅。
         h = lambda_t - lambda_s
         if self.config.algorithm_type == "dpmsolver++":
+            # 一阶 ODE 更新（类似 DDIM）：由当前 sample 和模型输出推进到下一时刻。
             x_t = (sigma_t /
                    sigma_s) * sample - (alpha_t *
                                         (torch.exp(-h) - 1.0)) * model_output
@@ -472,6 +540,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                                         (torch.exp(h) - 1.0)) * model_output
         elif self.config.algorithm_type == "sde-dpmsolver++":
             assert noise is not None
+            # SDE 版本：在确定性漂移项外加入随机扩散项（noise）。
             x_t = ((sigma_t / sigma_s * torch.exp(-h)) * sample +
                    (alpha_t * (1 - torch.exp(-2.0 * h))) * model_output +
                    sigma_t * torch.sqrt(1.0 - torch.exp(-2 * h)) * noise)
@@ -526,6 +595,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Passing `prev_timestep` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
             )
 
+        # s0: 当前步，s1: 上一步，t: 下一步；二阶法需要两段历史信息。
         sigma_t, sigma_s0, sigma_s1 = (
             self.sigmas[self.step_index + 1],  # pyright: ignore
             self.sigmas[self.step_index],
@@ -540,8 +610,10 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
         lambda_s1 = torch.log(alpha_s1) - torch.log(sigma_s1)
 
+        # m0,m1: 最近两次模型输出（流/噪声估计）。
         m0, m1 = model_output_list[-1], model_output_list[-2]
 
+        # r0: 相邻步长比；D0,D1 为 0/1 阶差分项，用于二阶外推。
         h, h_0 = lambda_t - lambda_s0, lambda_s0 - lambda_s1
         r0 = h_0 / h
         D0, D1 = m0, (1.0 / r0) * (m0 - m1)
@@ -636,6 +708,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Passing `prev_timestep` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
             )
 
+        # 三阶法使用 3 段历史输出：s0(当前)、s1、s2。
         sigma_t, sigma_s0, sigma_s1, sigma_s2 = (
             self.sigmas[self.step_index + 1],  # pyright: ignore
             self.sigmas[self.step_index],
@@ -653,9 +726,11 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         lambda_s1 = torch.log(alpha_s1) - torch.log(sigma_s1)
         lambda_s2 = torch.log(alpha_s2) - torch.log(sigma_s2)
 
+        # m0,m1,m2: 最近三次网络输出。
         m0, m1, m2 = model_output_list[-1], model_output_list[
             -2], model_output_list[-3]
 
+        # D0,D1,D2: 0/1/2 阶差分项；三阶公式利用曲率信息减少离散误差。
         h, h_0, h_1 = lambda_t - lambda_s0, lambda_s0 - lambda_s1, lambda_s1 - lambda_s2
         r0, r1 = h_0 / h, h_1 / h
         D0 = m0
@@ -677,6 +752,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         return x_t  # pyright: ignore
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
+        # 在离散时间表中查找给定 timestep 的索引位置。
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
@@ -695,6 +771,8 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         Initialize the step_index counter for the scheduler.
         """
 
+        # 若是普通 txt2img 流程，从当前 timestep 自动定位索引；
+        # 若是 img2img/inpaint，可能由 begin_index 指定中途起点。
         if self.begin_index is None:
             if isinstance(timestep, torch.Tensor):
                 timestep = timestep.to(self.timesteps.device)
@@ -740,18 +818,23 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             )
 
         if self.step_index is None:
+            # 首次 step 时根据当前 timestep 初始化内部步计数器。
             self._init_step_index(timestep)
 
         # Improve numerical stability for small number of steps
+        # lower_order_final: 最后一两步切换低阶法，减少高阶外推在末端的抖动。
         lower_order_final = (self.step_index == len(self.timesteps) - 1) and (
             self.config.euler_at_final or
             (self.config.lower_order_final and len(self.timesteps) < 15) or
             self.config.final_sigmas_type == "zero")
+        # lower_order_second: 倒数第二步必要时也降阶。
         lower_order_second = ((self.step_index == len(self.timesteps) - 2) and
                               self.config.lower_order_final and
                               len(self.timesteps) < 15)
 
+        # 将网络原始输出统一映射到求解器期望变量（x0_pred 或 epsilon）。
         model_output = self.convert_model_output(model_output, sample=sample)
+        # 维护历史窗口：左移并写入最新输出，供二阶/三阶多步法使用。
         for i in range(self.config.solver_order - 1):
             self.model_outputs[i] = self.model_outputs[i + 1]
         self.model_outputs[-1] = model_output
@@ -760,18 +843,22 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         sample = sample.to(torch.float32)
         if self.config.algorithm_type in ["sde-dpmsolver", "sde-dpmsolver++"
                                          ] and variance_noise is None:
+            # SDE 采样需要随机项；若未外部传入则在此采样标准噪声。
             noise = randn_tensor(
                 model_output.shape,
                 generator=generator,
                 device=model_output.device,
                 dtype=torch.float32)
         elif self.config.algorithm_type in ["sde-dpmsolver", "sde-dpmsolver++"]:
+            # 使用外部给定噪声（如可复现实验或特定编辑任务）。
             noise = variance_noise.to(
                 device=model_output.device,
                 dtype=torch.float32)  # pyright: ignore
         else:
+            # ODE 变体不需要随机扩散噪声。
             noise = None
 
+        # 根据配置阶数和当前可用历史长度，选择一阶/二阶/三阶更新公式。
         if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
             prev_sample = self.dpm_solver_first_order_update(
                 model_output, sample=sample, noise=noise)
@@ -783,12 +870,15 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 self.model_outputs, sample=sample)
 
         if self.lower_order_nums < self.config.solver_order:
+            # 前若干步历史不足，逐步提升到目标阶数。
             self.lower_order_nums += 1
 
         # Cast sample back to expected dtype
+        # 输出回到模型原 dtype（如 fp16/bf16）以保持管线一致性。
         prev_sample = prev_sample.to(model_output.dtype)
 
         # upon completion increase step index by one
+        # 内部时间前进一格，准备下次 step。
         self._step_index += 1  # pyright: ignore
 
         if not return_dict:
@@ -809,6 +899,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 A scaled input sample.
         """
+        # 该调度器不需要额外缩放输入，恒等返回。
         return sample
 
     # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.scale_model_input
@@ -819,6 +910,8 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         timesteps: torch.IntTensor,
     ) -> torch.Tensor:
         # Make sure sigmas and timesteps have the same device and dtype as original_samples
+        # original_samples: 干净样本 x0；noise: 高斯噪声 z；timesteps: 指定加噪时刻 t。
+        # 目标是构造 x_t = alpha_t * x0 + sigma_t * z（前向扩散/训练常用）。
         sigmas = self.sigmas.to(
             device=original_samples.device, dtype=original_samples.dtype)
         if original_samples.device.type == "mps" and torch.is_floating_point(
@@ -834,24 +927,30 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         # begin_index is None when the scheduler is used for training or pipeline does not implement set_begin_index
         if self.begin_index is None:
+            # 训练/普通流程：逐个 timestep 查索引。
             step_indices = [
                 self.index_for_timestep(t, schedule_timesteps)
                 for t in timesteps
             ]
         elif self.step_index is not None:
             # add_noise is called after first denoising step (for inpainting)
+            # 已进入采样中途：使用当前 step_index。
             step_indices = [self.step_index] * timesteps.shape[0]
         else:
             # add noise is called before first denoising step to create initial latent(img2img)
+            # 采样前准备 latent：使用 begin_index 对应噪声级别。
             step_indices = [self.begin_index] * timesteps.shape[0]
 
+        # 取出每个样本对应的 sigma，并扩展维度以匹配张量广播。
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < len(original_samples.shape):
             sigma = sigma.unsqueeze(-1)
 
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
+        # 前向扰动方程：把干净样本和噪声按权重线性混合得到 noisy_samples。
         noisy_samples = alpha_t * original_samples + sigma_t * noise
         return noisy_samples
 
     def __len__(self):
+        # 返回训练时间长度 T（调度器可用作长度对象）。
         return self.config.num_train_timesteps

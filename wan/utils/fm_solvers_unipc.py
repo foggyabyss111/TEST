@@ -17,6 +17,24 @@ if is_scipy_available():
     import scipy.stats
 
 
+def _safe_np_to_tensor(arr, dtype=None):
+    if isinstance(arr, torch.Tensor):
+        return arr if dtype is None else arr.to(dtype)
+    arr = np.ascontiguousarray(arr)
+    if arr.dtype == np.float32:
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.float32)
+    elif arr.dtype == np.float64:
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.float64)
+    elif arr.dtype in (np.int32, np.uint32):
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.int32 if arr.dtype == np.int32 else torch.uint32)
+    elif arr.dtype in (np.int64, np.uint64):
+        t = torch.frombuffer(bytearray(arr.tobytes()), dtype=torch.int64 if arr.dtype == np.int64 else torch.uint64)
+    else:
+        t = torch.tensor(arr)
+    t = t.reshape(arr.shape).to(torch.float32 if dtype is None else dtype)
+    return t
+
+
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
     """
     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.
@@ -107,7 +125,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         alphas = np.linspace(1, 1 / num_train_timesteps,
                              num_train_timesteps)[::-1].copy()
         sigmas = 1.0 - alphas
-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
+        sigmas = _safe_np_to_tensor(sigmas, dtype=torch.float32)
 
         if not use_dynamic_shifting:
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
@@ -206,8 +224,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         sigmas = np.concatenate([sigmas, [sigma_last]
                                 ]).astype(np.float32)  # pyright: ignore
 
-        self.sigmas = torch.from_numpy(sigmas)
-        self.timesteps = torch.from_numpy(timesteps).to(
+        self.sigmas = _safe_np_to_tensor(sigmas)
+        self.timesteps = _safe_np_to_tensor(timesteps).to(
             device=device, dtype=torch.int64)
 
         self.num_inference_steps = len(timesteps)

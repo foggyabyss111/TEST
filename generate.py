@@ -353,15 +353,16 @@ def read_video_to_tensor(video_path, device=None):
     cap.release()
 
     if frames_list:
-        # Stack the frames into a single numpy array (T, H, W, C)
-        video_array = np.array(frames_list)
-        
-        # Ensure it's a standard numpy array (fix for type mismatch)
-        video_array = np.ascontiguousarray(video_array, dtype=np.uint8)
+        # Stack frames as a contiguous uint8 array, then bypass numpy->torch
+        # interop quirks seen in some cloud environments.
+        video_array = np.ascontiguousarray(np.stack(frames_list, axis=0),
+                                           dtype=np.uint8)
 
         # --- Conversion to Tensor ---
-        # 1. Convert numpy array to torch tensor (inherits shape: T, H, W, C)
-        video_tensor = torch.tensor(video_array) # shape (T, H, W, C), dtype uint8
+        # 1. Convert bytes to torch tensor (inherits shape: T, H, W, C)
+        video_tensor = torch.frombuffer(
+            bytearray(video_array.tobytes()),
+            dtype=torch.uint8).reshape(video_array.shape)
 
         # 2. Permute dimensions to (C, T, H, W)
         video_tensor = video_tensor.permute(3, 0, 1, 2) # shape (C, T, H, W)
@@ -502,6 +503,11 @@ def generate(args):
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
         if args.image is None:
             args.image = EXAMPLE_PROMPT[args.task]["image"]
+        if args.pnp:
+            if args.image_origin is None:
+                raise ValueError("PnP mode requires --image_origin.")
+            if args.prompt_origin is None:
+                args.prompt_origin = ""
         logging.info(f"Input prompt: {args.prompt}")
         logging.info(f"Input image: {args.image}")
 
@@ -546,6 +552,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            offload_model=args.offload_model,
         )
 
         logging.info("Generating video ...")

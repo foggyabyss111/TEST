@@ -13,7 +13,6 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -28,6 +27,17 @@ from .utils.fm_solvers_origin import FlowMatchScheduler
 from .utils.fm_solvers_modified import FlowMatchNewScheduler
 
 
+def _pil_to_norm_tensor(pic, device):
+    if pic.mode != "RGB":
+        pic = pic.convert("RGB")
+    width, height = pic.size
+    tensor = torch.frombuffer(
+        bytearray(pic.tobytes()),
+        dtype=torch.uint8).reshape(height, width, 3)
+    tensor = tensor.permute(2, 0, 1).contiguous().to(torch.float32).div_(255.0)
+    return tensor.sub_(0.5).div_(0.5).to(device)
+
+
 class WanI2V:
 
     def __init__(
@@ -40,6 +50,7 @@ class WanI2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        offload_model=False,
         init_on_cpu=True,
     ):
         r"""
@@ -70,6 +81,7 @@ class WanI2V:
         self.rank = rank
         self.use_usp = use_usp
         self.t5_cpu = t5_cpu
+        self.offload_model = offload_model
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -96,12 +108,14 @@ class WanI2V:
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        if self.offload_model:
+            self.clip.model.cpu()
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
-        if t5_fsdp or dit_fsdp or use_usp:
+        if t5_fsdp or dit_fsdp or (use_usp and not self.offload_model):
             init_on_cpu = False
 
         if use_usp:
@@ -123,10 +137,16 @@ class WanI2V:
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
-            if not init_on_cpu:
+            if not init_on_cpu and not self.offload_model:
                 self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+    def _move_vae(self, device):
+        self.vae.model.to(device)
+        self.vae.mean = self.vae.mean.to(device=device, dtype=self.vae.dtype)
+        self.vae.std = self.vae.std.to(device=device, dtype=self.vae.dtype)
+        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
 
     def generate(self,
                  input_prompt,
@@ -186,7 +206,7 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        img = _pil_to_norm_tensor(img, self.device)
 
         F = frame_num
         h, w = img.shape[1:]
@@ -272,6 +292,9 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+        if offload_model:
+            self._move_vae(torch.device('cpu'))
+            torch.cuda.empty_cache()
 
         @contextmanager
         def noop_no_sync():
@@ -313,7 +336,7 @@ class WanI2V:
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'fm_new':
                 sample_scheduler = FlowMatchNewScheduler(
-                    num_inference_steps=51,
+                    num_inference_steps=sampling_steps,
                     num_train_timesteps=self.num_train_timesteps,
                     shift=5.0,
                 )
@@ -330,63 +353,11 @@ class WanI2V:
             if self.rank == 0:
                 print("Scheduler: ", sample_solver)
 
-            # <<< Inversion-free modification START >>>
-            if load_intermediate_latent_path is not None:
-                num_t = load_intermediate_latent_t
-                intermediate_data = torch.load(load_intermediate_latent_path, map_location='cpu')
-                initial_latent = intermediate_data[num_t]
-                assert initial_latent.shape == expected_latent_shape
-                latent = initial_latent.to(device=self.device, dtype=torch.float32)
-                if self.rank == 0:
-                    print(f"Using provided initial latent from {load_intermediate_latent_path}.")
-            else:
-                if self.rank == 0:
-                    print(f"Inversion-free mode: Initializing latents from source video with t_start={inversion_free_t_start} (Chord-style).")
-                if video is None:
-                    raise ValueError("Inversion-free mode requires source video input.")
-                
-                # Filter timesteps based on inversion_free_t_start
-                # inversion_free_t_start is 0.0 to 1.0, where 1.0 is full noise (t=1000)
-                # We need to find the timesteps that are <= inversion_free_t_start * 1000
-                threshold = inversion_free_t_start * self.num_train_timesteps
-                # Find the first index where timestep is <= threshold
-                start_idx = 0
-                for idx, t_val in enumerate(timesteps):
-                    if t_val <= threshold:
-                        start_idx = idx
-                        break
-                
-                # Slice timesteps to start from the chosen noise level
-                timesteps = timesteps[start_idx:]
-                if self.rank == 0:
-                    print(f"Adjusted timesteps to start from index {start_idx}, t={timesteps[0]:.2f}")
-
-                # Encode source video
-                video = video.to(self.device)
-                latent_src = self.vae.encode([video])[0]
-                
-                # Add noise at the NEW first timestep
-                t_start = timesteps[0]
-                noise = torch.randn_like(latent_src)
-                
-                if hasattr(sample_scheduler, 'add_noise'):
-                    latent = sample_scheduler.add_noise(latent_src, noise, t_start)
-                else:
-                    # Fallback for other schedulers if they don't have add_noise
-                    # In FlowMatch, z_t = (1-sigma)*x + sigma*epsilon
-                    # We need sigma. For now let's assume fm_new is used as in the demos.
-                    sigma = t_start / self.num_train_timesteps # Simple linear assumption if not fm_new
-                    latent = (1 - sigma) * latent_src + sigma * noise
-                
-                latent = latent.to(device=self.device, dtype=torch.float32)
-
-            latent_origin = latent.clone().detach().to(device=self.device, dtype=torch.float32)
-            # <<< Inversion-free modification END >>>
-
             if offload_model:
                 torch.cuda.empty_cache()
 
-            self.model.to(self.device)
+            if not hasattr(self.model, "_fsdp_wrapped_module"):
+                self.model.to(self.device)
             
             for progress_id, t in enumerate(tqdm(timesteps)):
                 # <<< MODIFICATION START: 保存当前的 latent (即x_t) >>>
@@ -459,11 +430,15 @@ class WanI2V:
                                                           torch.stack([t]).to(self.device), latent.unsqueeze(0)).squeeze(0)
                     del latent_model_input_mid
                     
-                    if self.rank == 0:
+                    if self.rank == 0 and latent_output_dir is not None:
+                        if offload_model:
+                            self._move_vae(self.device)
                         temp_video = self.vae.decode([latent.to(self.device)])
                         import os
                         os.makedirs(f"/nvme2/vision/Wan2.1/intermediate_videos/{latent_output_dir}", exist_ok=True)
                         torch.save(temp_video[0], f"/nvme2/vision/Wan2.1/intermediate_videos/{latent_output_dir}/{progress_id}.pt")
+                        if offload_model:
+                            self._move_vae(torch.device('cpu'))
                     
                     
                 else:       
@@ -481,6 +456,7 @@ class WanI2V:
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
+                self._move_vae(self.device)
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
@@ -566,8 +542,9 @@ class WanI2V:
         """
         if self.rank == 0:
             print("PnP init!")
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-        img_origin = TF.to_tensor(img_origin).sub_(0.5).div_(0.5).to(self.device)
+        input_prompt_origin = input_prompt_origin or ""
+        img = _pil_to_norm_tensor(img, self.device)
+        img_origin = _pil_to_norm_tensor(img_origin, self.device)
 
         F = frame_num
         h, w = img.shape[1:]
@@ -668,6 +645,9 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y2 = torch.concat([msk, y2])
+        if offload_model:
+            self._move_vae(torch.device('cpu'))
+            torch.cuda.empty_cache()
 
         @contextmanager
         def noop_no_sync():
@@ -716,10 +696,68 @@ class WanI2V:
             if self.rank == 0:
                 print("Scheduler: ", sample_solver)
 
+            if load_intermediate_latent_path is not None:
+                num_t = load_intermediate_latent_t
+                intermediate_data = torch.load(
+                    load_intermediate_latent_path, map_location='cpu')
+                initial_latent = intermediate_data[num_t]
+                assert initial_latent.shape == expected_latent_shape
+                latent = initial_latent.to(
+                    device=self.device, dtype=torch.float32)
+                if self.rank == 0:
+                    print(
+                        f"Using provided initial latent from {load_intermediate_latent_path}."
+                    )
+            else:
+                if self.rank == 0:
+                    print(
+                        f"Inversion-free mode: Initializing latents from source video with t_start={inversion_free_t_start} (Chord-style)."
+                    )
+                if video is None:
+                    raise ValueError(
+                        "Inversion-free mode requires source video input.")
+
+                threshold = inversion_free_t_start * self.num_train_timesteps
+                start_idx = 0
+                for idx, t_val in enumerate(timesteps):
+                    if t_val <= threshold:
+                        start_idx = idx
+                        break
+
+                timesteps = timesteps[start_idx:]
+                if self.rank == 0:
+                    print(
+                        f"Adjusted timesteps to start from index {start_idx}, t={timesteps[0]:.2f}"
+                    )
+
+                if offload_model:
+                    self._move_vae(self.device)
+                video = video.to(self.device)
+                latent_src = self.vae.encode([video])[0]
+                if offload_model:
+                    self._move_vae(torch.device('cpu'))
+                    torch.cuda.empty_cache()
+
+                t_start = timesteps[0]
+                noise = torch.randn_like(latent_src)
+
+                if hasattr(sample_scheduler, 'add_noise'):
+                    latent = sample_scheduler.add_noise(
+                        latent_src, noise, t_start)
+                else:
+                    sigma = t_start / self.num_train_timesteps
+                    latent = (1 - sigma) * latent_src + sigma * noise
+
+                latent = latent.to(device=self.device, dtype=torch.float32)
+
+            latent_origin = latent.clone().detach().to(
+                device=self.device, dtype=torch.float32)
+
             if offload_model:
                 torch.cuda.empty_cache()
 
-            self.model.to(self.device)
+            if not hasattr(self.model, "_fsdp_wrapped_module"):
+                self.model.to(self.device)
             
             for progress_id, t in enumerate(tqdm(timesteps)):
                 
@@ -834,6 +872,7 @@ class WanI2V:
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
+                self._move_vae(self.device)
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
@@ -867,7 +906,7 @@ class WanI2V:
                  is_delete=False,
                  ):
         
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        img = _pil_to_norm_tensor(img, self.device)
         video = video.to(self.device)
         if self.rank == 0:
             print("Reconstruction mode!")
@@ -953,6 +992,9 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+        if offload_model:
+            self._move_vae(torch.device('cpu'))
+            torch.cuda.empty_cache()
 
         @contextmanager
         def noop_no_sync():
@@ -1142,6 +1184,7 @@ class WanI2V:
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
+                self._move_vae(self.device)
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)

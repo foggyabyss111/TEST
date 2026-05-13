@@ -26,3 +26,8 @@ ChordEdit/
 # IDE
 .vscode/
 .idea/
+Chordedit/
+contextflow_old/
+.tmp_fm_solvers_diff.txt
+MODIFICATION_REPORT.md
+MODIFICATION_REPORT_CN_ONE_PAGE.md
