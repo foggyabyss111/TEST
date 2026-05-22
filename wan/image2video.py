@@ -308,6 +308,7 @@ class WanI2V:
 
         # evaluation mode
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            timestep_offset = 0
 
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
@@ -503,6 +504,7 @@ class WanI2V:
                  latent_output_dir=None,
                  is_delete=False,
                  inversion_free_t_start=1.0,
+                 weak_inversion_steps=0,
                  ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -566,13 +568,14 @@ class WanI2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
         
-        expected_latent_shape = (16, 21, lat_h, lat_w) if not is_delete else (16, 13, lat_h, lat_w)
+        latent_frames = (F - 1) // self.vae_stride[0] + 1
+        expected_latent_shape = (16, latent_frames, lat_h, lat_w)
         
         # <<< Inversion-free modification START >>>
         # We will initialize the latent later after scheduler setup if in inversion-free mode
         # <<< Inversion-free modification END >>>
         
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device) if not is_delete else torch.ones(1, 49, lat_h, lat_w, device=self.device)
+        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
@@ -612,15 +615,7 @@ class WanI2V:
                 torch.nn.functional.interpolate(
                     img_origin[None].cpu(), size=(h, w), mode='bicubic').transpose(
                         0, 1),
-                torch.zeros(3, 80, h, w)
-            ],
-                         dim=1).to(self.device) 
-        ])[0] if not is_delete else self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img_origin[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, 48, h, w)
+                torch.zeros(3, F - 1, h, w)
             ],
                          dim=1).to(self.device) 
         ])[0]
@@ -632,15 +627,7 @@ class WanI2V:
                 torch.nn.functional.interpolate(
                     img[None].cpu(), size=(h, w), mode='bicubic').transpose(
                         0, 1),
-                torch.zeros(3, 80, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0] if not is_delete else self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, 48, h, w)
+                torch.zeros(3, F - 1, h, w)
             ],
                          dim=1).to(self.device)
         ])[0]
@@ -657,6 +644,7 @@ class WanI2V:
 
         # evaluation mode
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            timestep_offset = 0
 
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
@@ -725,6 +713,7 @@ class WanI2V:
                         break
 
                 timesteps = timesteps[start_idx:]
+                timestep_offset = start_idx
                 if self.rank == 0:
                     print(
                         f"Adjusted timesteps to start from index {start_idx}, t={timesteps[0]:.2f}"
@@ -738,20 +727,204 @@ class WanI2V:
                     self._move_vae(torch.device('cpu'))
                     torch.cuda.empty_cache()
 
+                latent_src = latent_src.to(device=self.device,
+                                           dtype=torch.float32)
+
+                def add_noise_to_latent(latent_clean, timestep):
+                    noise = torch.randn(
+                        latent_clean.shape,
+                        generator=seed_g,
+                        device=latent_clean.device,
+                        dtype=latent_clean.dtype)
+                    if hasattr(sample_scheduler, 'add_noise'):
+                        return sample_scheduler.add_noise(latent_clean, noise,
+                                                          timestep)
+                    sigma = timestep / self.num_train_timesteps
+                    return (1 - sigma) * latent_clean + sigma * noise
+
+                # Run a short CFG warmup before PnP so we do not enter the
+                # shared sampling loop from the raw highest-noise state.
+                def run_cfg_warmup(latent_start, warmup_timesteps,
+                                   warmup_offset, cond_context, cond_clip_fea,
+                                   cond_y, warmup_guide_scale, warmup_label):
+                    if len(warmup_timesteps) == 0:
+                        return latent_start
+
+                    warmup_context_list = [cond_context, context_null[0]]
+                    warmup_clip_fea = torch.cat(
+                        [cond_clip_fea, cond_clip_fea], dim=0)
+                    warmup_y_list = [cond_y, cond_y]
+                    latent_warm = latent_start
+
+                    if self.rank == 0:
+                        print(
+                            f"{warmup_label}: {len(warmup_timesteps)} steps from t={warmup_timesteps[0]:.2f}"
+                        )
+
+                    for warmup_idx, warmup_t in enumerate(warmup_timesteps):
+                        latent_model_input_warm = [
+                            latent_warm.to(self.device),
+                            latent_warm.to(self.device)
+                        ]
+                        timestep_warm = torch.stack(
+                            [warmup_t, warmup_t]).to(self.device)
+
+                        noise_preds_warm = self.model(
+                            x=latent_model_input_warm,
+                            t=timestep_warm,
+                            context=warmup_context_list,
+                            seq_len=max_seq_len,
+                            clip_fea=warmup_clip_fea,
+                            y=warmup_y_list,
+                            pnp=False,
+                            progress_id=warmup_idx,
+                            sampling_steps=len(warmup_timesteps),
+                            latent_output_dir=None,
+                        )
+
+                        if offload_model:
+                            torch.cuda.empty_cache()
+
+                        noise_pred_warm_cond = noise_preds_warm[0].to(
+                            torch.device('cpu') if offload_model else self.device)
+                        noise_pred_warm_uncond = noise_preds_warm[1].to(
+                            torch.device('cpu') if offload_model else self.device)
+                        noise_pred_warm = noise_pred_warm_uncond + warmup_guide_scale * (
+                            noise_pred_warm_cond - noise_pred_warm_uncond)
+
+                        latent_warm = latent_warm.to(
+                            torch.device('cpu') if offload_model else self.device)
+
+                        if sample_solver == "fm_new":
+                            latents_mid_warm = sample_scheduler.step_mid(
+                                noise_pred_warm.unsqueeze(0),
+                                torch.stack([warmup_t]).to(self.device),
+                                latent_warm.unsqueeze(0))
+
+                            latent_model_input_mid = [
+                                latents_mid_warm[0].to(self.device),
+                                latents_mid_warm[0].to(self.device)
+                            ]
+
+                            next_t = sample_scheduler.timesteps[
+                                warmup_offset + warmup_idx + 1]
+                            t_mid = (torch.stack([warmup_t]) + next_t) / 2
+                            timestep_mid = torch.stack(
+                                [t_mid[0], t_mid[0]]).to(self.device)
+
+                            noise_preds_warm_mid = self.model(
+                                x=latent_model_input_mid,
+                                t=timestep_mid,
+                                context=warmup_context_list,
+                                seq_len=max_seq_len,
+                                clip_fea=warmup_clip_fea,
+                                y=warmup_y_list,
+                                pnp=False,
+                                latent_output_dir=None,
+                            )
+
+                            if offload_model:
+                                torch.cuda.empty_cache()
+
+                            noise_pred_warm_mid_cond = noise_preds_warm_mid[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                            noise_pred_warm_mid_uncond = noise_preds_warm_mid[1].to(
+                                torch.device('cpu') if offload_model else self.device)
+                            noise_pred_warm_mid = noise_pred_warm_mid_uncond + warmup_guide_scale * (
+                                noise_pred_warm_mid_cond -
+                                noise_pred_warm_mid_uncond)
+
+                            latent_warm = sample_scheduler.step_solver(
+                                noise_pred_warm_mid.unsqueeze(0),
+                                noise_pred_warm.unsqueeze(0),
+                                torch.stack([warmup_t]).to(self.device),
+                                latent_warm.unsqueeze(0)).squeeze(0)
+                            del latent_model_input_mid
+                        else:
+                            temp_warm = sample_scheduler.step(
+                                noise_pred_warm.unsqueeze(0),
+                                warmup_t,
+                                latent_warm.unsqueeze(0),
+                                return_dict=False,
+                                generator=seed_g)[0]
+                            latent_warm = temp_warm.squeeze(0)
+
+                    return latent_warm.to(device=self.device,
+                                          dtype=torch.float32)
+
                 t_start = timesteps[0]
-                noise = torch.randn_like(latent_src)
+                latent_noised = add_noise_to_latent(latent_src, t_start).to(
+                    device=self.device, dtype=torch.float32)
+                latent_origin = latent_noised.clone().detach().to(
+                    device=self.device, dtype=torch.float32)
+                latent = latent_noised.clone().detach().to(
+                    device=self.device, dtype=torch.float32)
 
-                if hasattr(sample_scheduler, 'add_noise'):
-                    latent = sample_scheduler.add_noise(
-                        latent_src, noise, t_start)
-                else:
-                    sigma = t_start / self.num_train_timesteps
-                    latent = (1 - sigma) * latent_src + sigma * noise
+                source_warmup_guide = min(max(guide_scale, 1.0), 1.5)
+                edit_warmup_guide = min(max(guide_scale + 0.5, 2.0), 3.0)
 
-                latent = latent.to(device=self.device, dtype=torch.float32)
+                warmup_steps = min(max(int(weak_inversion_steps), 0),
+                                   max(len(timesteps) - 1, 0))
+                if warmup_steps > 0:
+                    warmup_timesteps = timesteps[:warmup_steps]
+                    latent_origin = run_cfg_warmup(
+                        latent_origin,
+                        warmup_timesteps,
+                        timestep_offset,
+                        context_origin[0],
+                        clip_context_origin,
+                        y1,
+                        source_warmup_guide,
+                        "Origin prewarmup")
+                    latent = run_cfg_warmup(
+                        latent,
+                        warmup_timesteps,
+                        timestep_offset,
+                        context[0],
+                        clip_context,
+                        y2,
+                        edit_warmup_guide,
+                        "Edit-only prewarmup")
+                    timesteps = timesteps[warmup_steps:]
+                    timestep_offset += warmup_steps
+                    if self.rank == 0:
+                        print(
+                            f"Prewarmup consumed {warmup_steps} steps. Main PnP starts at t={timesteps[0]:.2f}"
+                        )
 
-            latent_origin = latent.clone().detach().to(
-                device=self.device, dtype=torch.float32)
+                edit_warmup_steps = min(4, max(len(timesteps) - 1, 0))
+                if edit_warmup_steps > 0:
+                    branch_timesteps = timesteps[:edit_warmup_steps]
+                    branch_offset = timestep_offset
+                    latent_origin = run_cfg_warmup(
+                        latent_origin,
+                        branch_timesteps,
+                        branch_offset,
+                        context_origin[0],
+                        clip_context_origin,
+                        y1,
+                        source_warmup_guide,
+                        "Origin branch warmup")
+                    latent = run_cfg_warmup(
+                        latent.clone().detach().to(
+                            device=self.device, dtype=torch.float32),
+                        branch_timesteps,
+                        branch_offset,
+                        context[0],
+                        clip_context,
+                        y2,
+                        edit_warmup_guide,
+                        "Edit branch warmup")
+                    timesteps = timesteps[edit_warmup_steps:]
+                    timestep_offset += edit_warmup_steps
+                    if self.rank == 0:
+                        print(
+                            f"Branch warmup consumed {edit_warmup_steps} steps. Main PnP starts at t={timesteps[0]:.2f}"
+                        )
+
+            if load_intermediate_latent_path is not None:
+                latent_origin = latent.clone().detach().to(
+                    device=self.device, dtype=torch.float32)
 
             if offload_model:
                 torch.cuda.empty_cache()
@@ -812,7 +985,8 @@ class WanI2V:
                                               latents_mid[0].to(self.device), latents_mid[0].to(self.device)]
                     
                     #t_mid = (timestep + sample_scheduler.timesteps[progress_id + 1]) / 2
-                    t_mid = (torch.stack([t]) + sample_scheduler.timesteps[progress_id + 1]) / 2
+                    t_mid = (torch.stack([t]) + sample_scheduler.timesteps[
+                        timestep_offset + progress_id + 1]) / 2
                     timestep_mid = torch.stack([t_mid[0], t_mid[0], t_mid[0]]).to(self.device) 
                     
                     noise_preds_list_mid = self.model(
@@ -932,14 +1106,15 @@ class WanI2V:
         seed_g.manual_seed(seed)
         
         # video_latent
-        expected_latent_shape = (16, 21, lat_h, lat_w) if not is_delete else (16, 13, lat_h, lat_w)
+        latent_frames = (F - 1) // self.vae_stride[0] + 1
+        expected_latent_shape = (16, latent_frames, lat_h, lat_w)
         latent = self.vae.encode([video])[0]
         if self.rank == 0:
             print(latent.shape)
         assert latent.shape == expected_latent_shape
         
         
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device) if not is_delete else torch.ones(1, 49, lat_h, lat_w, device=self.device)
+        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
@@ -979,15 +1154,7 @@ class WanI2V:
                 torch.nn.functional.interpolate(
                     img[None].cpu(), size=(h, w), mode='bicubic').transpose(
                         0, 1),
-                torch.zeros(3, 80, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0] if not is_delete else self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, 48, h, w)
+                torch.zeros(3, F - 1, h, w)
             ],
                          dim=1).to(self.device)
         ])[0]

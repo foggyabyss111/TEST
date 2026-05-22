@@ -19,10 +19,12 @@ python -m torch.distributed.run --nproc_per_node=2 generate.py \
   --dit_fsdp \
   --ulysses_size 2 \
   --pnp_layers 6 7 8 9 \
-  --injection_step 0.5 \
-  --prompt_origin "" \
+  --injection_step 0.9 \
+  --prompt_origin "A red poppy flower surrounded by purple flowers." \
   --prompt "A red poppy flower surrounded by purple flowers. A large gorilla is gently trying to touch the red poppy flower." \
   --sample_solver fm_new \
-  --sample_steps 10 \
+  --sample_steps 20 \
+  --inversion_free_t_start 1.0 \
+  --weak_inversion_steps 4 \
   --offload_model True \
-  --sample_guide_scale 3.0
+  --sample_guide_scale 2.5
