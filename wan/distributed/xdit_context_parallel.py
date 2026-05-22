@@ -135,6 +135,7 @@ def usp_dit_forward(
         pnp=False,
         progress_id=progress_id, # <--- 新增传递参数
         sampling_steps=sampling_steps, # <--- 新增传递参数
+        pnp_layers=pnp_layers,
         index=None,
         injection_step=injection_step,
         latent_output_dir=latent_output_dir,
@@ -179,6 +180,7 @@ def usp_attn_forward(self,
                      index=None,
                      injection_step=None,
                      latent_output_dir=None,
+                     pnp_layers=None,
                      dtype=torch.bfloat16,
                      ):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -200,43 +202,57 @@ def usp_attn_forward(self,
     
     # PnP Injection
     if pnp is True and progress_id is not None and sampling_steps is not None:
-        early_steps_threshold = int(injection_step * sampling_steps)
-        
-        if progress_id < early_steps_threshold:
-            if b == 3:
-                
-                k_1 = torch.concat((k[1], k[0].clone()), dim=0)
-                v_1 = torch.concat((v[1], v[0].clone()), dim=0)
-                
-                k_2 = torch.concat((k[2], k[0].clone()), dim=0)
-                v_2 = torch.concat((v[2], v[0].clone()), dim=0)
-                
-                new_k = torch.stack([k_1, k_2], dim=0)
-                new_v = torch.stack([v_1, v_2], dim=0)
-            
-                    
-                x_old = xFuserLongContextAttention()(
-                    None,
-                    query=half(q[0].unsqueeze(0)),
-                    key=half(k[0].unsqueeze(0)),
-                    value=half(v[0].unsqueeze(0)),
-                    window_size=self.window_size)
-                
-                x_new = xFuserLongContextAttention()(
-                    None,
-                    query=half(q[1:3]),
-                    key=half(new_k),
-                    value=half(new_v),
-                    window_size=self.window_size)
-                
-                x = torch.concat((x_old, x_new), dim=0)
-                    
-                x = x.flatten(2)
-                x = self.o(x)
-                
-                
-                return x
-                
+        pnp_strength = self._get_pnp_strength(
+            progress_id,
+            sampling_steps,
+            injection_step,
+            index=index,
+            pnp_layers=pnp_layers)
+
+        if pnp_strength > 0 and b == 3:
+            k_1 = torch.concat((k[1], k[0].clone()), dim=0)
+            v_1 = torch.concat((v[1], v[0].clone()), dim=0)
+
+            x_old = xFuserLongContextAttention()(
+                None,
+                query=half(q[0].unsqueeze(0)),
+                key=half(k[0].unsqueeze(0)),
+                value=half(v[0].unsqueeze(0)),
+                window_size=self.window_size)
+
+            x_cond_pnp = xFuserLongContextAttention()(
+                None,
+                query=half(q[1].unsqueeze(0)),
+                key=half(k_1.unsqueeze(0)),
+                value=half(v_1.unsqueeze(0)),
+                window_size=self.window_size)
+
+            x_cond_base = xFuserLongContextAttention()(
+                None,
+                query=half(q[1].unsqueeze(0)),
+                key=half(k[1].unsqueeze(0)),
+                value=half(v[1].unsqueeze(0)),
+                window_size=self.window_size)
+
+            x_uncond = xFuserLongContextAttention()(
+                None,
+                query=half(q[2].unsqueeze(0)),
+                key=half(k[2].unsqueeze(0)),
+                value=half(v[2].unsqueeze(0)),
+                window_size=self.window_size)
+
+            if pnp_strength < 1.0:
+                x_cond = torch.lerp(x_cond_base, x_cond_pnp, pnp_strength)
+            else:
+                x_cond = x_cond_pnp
+
+            x = torch.concat((x_old, x_cond, x_uncond), dim=0)
+
+            x = x.flatten(2)
+            x = self.o(x)
+
+            return x
+
 
     x = xFuserLongContextAttention()(
         None,

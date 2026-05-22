@@ -124,10 +124,54 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _get_pnp_strength(self,
+                          progress_id,
+                          sampling_steps,
+                          injection_step,
+                          index=None,
+                          pnp_layers=None):
+        if progress_id is None or sampling_steps is None or sampling_steps <= 0:
+            return 0.0
+
+        if injection_step is None:
+            injection_step = 0.0
+
+        layer_strength_scale = 1.0
+        layer_injection_scale = 1.0
+        if pnp_layers is not None and index is not None and index in pnp_layers:
+            ordered_layers = sorted(pnp_layers)
+            if len(ordered_layers) == 1:
+                layer_rank = 1.0
+            else:
+                layer_rank = ordered_layers.index(index) / (len(ordered_layers) - 1)
+
+            # Lower selected layers tend to disturb geometry more, so make them
+            # weaker and let them exit PnP earlier. Higher selected layers keep
+            # stronger, longer semantic guidance.
+            layer_strength_scale = 0.55 + 0.45 * layer_rank
+            layer_injection_scale = 0.60 + 0.40 * layer_rank
+            injection_step = injection_step * layer_injection_scale
+
+        early_steps = max(1, int(math.ceil(injection_step * sampling_steps)))
+        if progress_id < early_steps:
+            return layer_strength_scale
+
+        tail_steps = max(sampling_steps - early_steps, 1)
+        tail_progress = min(progress_id - early_steps + 1, tail_steps)
+
+        # Keep a weak reference pull in late denoising instead of dropping PnP
+        # to zero, which helps the edited subject stay stable in later frames.
+        start_strength = 0.35
+        end_strength = 0.15
+        decay = tail_progress / tail_steps
+        base_strength = start_strength * (1.0 - decay) + end_strength * decay
+        return base_strength * layer_strength_scale
+
     def forward(self, x, seq_lens, grid_sizes, freqs, pnp, progress_id, sampling_steps,
-                index=None,
-                injection_step=None,
-                latent_output_dir=None,):
+               index=None,
+               injection_step=None,
+               latent_output_dir=None,
+               pnp_layers=None,):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -150,42 +194,56 @@ class WanSelfAttention(nn.Module):
         
         # PnP Injection
         if pnp is True and progress_id is not None and sampling_steps is not None:
-            early_steps_threshold = int(injection_step * sampling_steps) # 前 20%
-            
-            if progress_id < early_steps_threshold:
-                if b == 3:
-                    
-                    k_1 = torch.concat((k[1], k[0].clone()), dim=0)
-                    v_1 = torch.concat((v[1], v[0].clone()), dim=0)
-                    
-                    k_2 = torch.concat((k[2], k[0].clone()), dim=0)
-                    v_2 = torch.concat((v[2], v[0].clone()), dim=0)
-                    
-                    new_k = torch.stack([k_1, k_2], dim=0)
-                    new_v = torch.stack([v_1, v_2], dim=0)
-                
-                        
-                    x_old = flash_attention(
-                        q=(q[0].unsqueeze(0)),
-                        k=(k[0].unsqueeze(0)),
-                        v=(v[0].unsqueeze(0)),
-                        k_lens=seq_lens[0:1] if seq_lens is not None else None,
-                        window_size=self.window_size)
-                    
-                    x_new = flash_attention(
-                        q=(q[1:3]),
-                        k=(new_k),
-                        v=(new_v),
-                        k_lens=None,
-                        window_size=self.window_size)
-                    
-                    x = torch.concat((x_old, x_new), dim=0)
-                        
-                    x = x.flatten(2)
-                    x = self.o(x)
-                    
-                    
-                    return x
+            pnp_strength = self._get_pnp_strength(
+                progress_id,
+                sampling_steps,
+                injection_step,
+                index=index,
+                pnp_layers=pnp_layers)
+
+            if pnp_strength > 0 and b == 3:
+                k_1 = torch.concat((k[1], k[0].clone()), dim=0)
+                v_1 = torch.concat((v[1], v[0].clone()), dim=0)
+
+                x_old = flash_attention(
+                    q=(q[0].unsqueeze(0)),
+                    k=(k[0].unsqueeze(0)),
+                    v=(v[0].unsqueeze(0)),
+                    k_lens=seq_lens[0:1] if seq_lens is not None else None,
+                    window_size=self.window_size)
+
+                x_cond_pnp = flash_attention(
+                    q=(q[1].unsqueeze(0)),
+                    k=(k_1.unsqueeze(0)),
+                    v=(v_1.unsqueeze(0)),
+                    k_lens=None,
+                    window_size=self.window_size)
+
+                x_cond_base = flash_attention(
+                    q=(q[1].unsqueeze(0)),
+                    k=(k[1].unsqueeze(0)),
+                    v=(v[1].unsqueeze(0)),
+                    k_lens=seq_lens[1:2] if seq_lens is not None else None,
+                    window_size=self.window_size)
+
+                x_uncond = flash_attention(
+                    q=(q[2].unsqueeze(0)),
+                    k=(k[2].unsqueeze(0)),
+                    v=(v[2].unsqueeze(0)),
+                    k_lens=seq_lens[2:3] if seq_lens is not None else None,
+                    window_size=self.window_size)
+
+                if pnp_strength < 1.0:
+                    x_cond = torch.lerp(x_cond_base, x_cond_pnp, pnp_strength)
+                else:
+                    x_cond = x_cond_pnp
+
+                x = torch.concat((x_old, x_cond, x_uncond), dim=0)
+
+                x = x.flatten(2)
+                x = self.o(x)
+
+                return x
         
 
         x = flash_attention(
@@ -331,6 +389,7 @@ class WanAttentionBlock(nn.Module):
         index,
         injection_step,
         latent_output_dir,
+        pnp_layers,
     ):
         r"""
         Args:
@@ -348,7 +407,8 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs, pnp, progress_id, sampling_steps, index, injection_step, latent_output_dir)
+            freqs, pnp, progress_id, sampling_steps, index, injection_step,
+            latent_output_dir, pnp_layers)
         
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
@@ -629,6 +689,7 @@ class WanModel(ModelMixin, ConfigMixin):
             sampling_steps=sampling_steps, # <--- 新增传递参数
             injection_step=injection_step,
             pnp=False,              # 新增
+            pnp_layers=pnp_layers,
             index=None,                # 新增 index 占位符
             latent_output_dir=None,    # 确保 AttentionBlock 里的参数都有
             )

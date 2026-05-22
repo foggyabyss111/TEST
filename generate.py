@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
+import gc
 from datetime import datetime
 import logging
 import os
@@ -267,6 +268,12 @@ def _parse_args():
         type=float,
         default=1.0,
         help="The starting time for inversion-free mode (0.0 to 1.0, where 1.0 is full noise)."
+        )
+    parser.add_argument(
+        "--weak_inversion_steps",
+        type=int,
+        default=0,
+        help="Run a short source-only reconstruction warmup before inversion-free initialization. 0 disables it."
         )
     
     # <<< MODIFICATION END >>>
@@ -580,6 +587,7 @@ def generate(args):
                 latent_output_dir=args.latent_output_dir,
                 is_delete=True if args.is_delete else False,
                 inversion_free_t_start=args.inversion_free_t_start,
+                weak_inversion_steps=args.weak_inversion_steps,
             )
         elif args.reconstruction:
             video = wan_i2v.generate_reconstruction(
@@ -623,14 +631,18 @@ def generate(args):
                 )
 
     if rank == 0:
+        suffix = '.png' if "t2i" in args.task else '.mp4'
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
-            suffix = '.png' if "t2i" in args.task else '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
-            if args.pnp:
+        if args.pnp:
+            if args.save_file is None:
                 save_file_origin = f"{args.task}_origin_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            else:
+                save_root, save_ext = os.path.splitext(args.save_file)
+                save_file_origin = f"{save_root}_origin{save_ext or suffix}"
             
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")
@@ -670,4 +682,15 @@ def generate(args):
 
 if __name__ == "__main__":
     args = _parse_args()
-    generate(args)
+    try:
+        generate(args)
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as cleanup_error:
+                logging.warning("Failed to destroy process group cleanly: %s",
+                                cleanup_error)
